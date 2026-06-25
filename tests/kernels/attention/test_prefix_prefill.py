@@ -15,9 +15,13 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, set_random_seed
 from vllm.v1.attention.ops.chunked_prefill_paged_decode import (
+    _build_compacted_seq_lens,
     chunked_prefill_paged_decode,
 )
-from vllm.v1.attention.ops.prefix_prefill import context_attention_fwd
+from vllm.v1.attention.ops.prefix_prefill import (
+    _build_compacted_context_lens,
+    context_attention_fwd,
+)
 
 NUM_HEADS = [64]
 NUM_QUERIES_PER_KV = [1, 64]
@@ -98,6 +102,42 @@ def create_alibi_causal_mask(
     # Add batch dimension: [1, num_heads, query_len, seq_len]
     # SDPA expects batch dimension even for single sequences
     return alibi_bias.unsqueeze(0)
+
+
+def test_build_compacted_context_lens():
+    token_presence_bitmap = torch.tensor(
+        [
+            [[1, 1, 0, 1, 0], [1, 1, 0, 1, 0]],
+            [[1, 0, 1, 1, 1], [1, 0, 1, 1, 1]],
+        ],
+        dtype=torch.int32,
+    )
+    context_lens = torch.tensor([4, 3], dtype=torch.int32)
+
+    compacted_ctx_lens = _build_compacted_context_lens(
+        token_presence_bitmap, context_lens
+    )
+
+    torch.testing.assert_close(
+        compacted_ctx_lens, torch.tensor([3, 2], dtype=torch.int32)
+    )
+
+
+def test_build_compacted_seq_lens():
+    token_presence_bitmap = torch.tensor(
+        [
+            [[1, 1, 0, 1, 0], [1, 1, 0, 1, 0]],
+            [[1, 0, 1, 1, 1], [1, 0, 1, 1, 1]],
+        ],
+        dtype=torch.int32,
+    )
+    seq_lens = torch.tensor([4, 3], dtype=torch.int32)
+
+    compacted_seq_lens = _build_compacted_seq_lens(token_presence_bitmap, seq_lens)
+
+    torch.testing.assert_close(
+        compacted_seq_lens, torch.tensor([3, 2], dtype=torch.int32)
+    )
 
 
 @pytest.mark.parametrize("num_heads", NUM_HEADS)

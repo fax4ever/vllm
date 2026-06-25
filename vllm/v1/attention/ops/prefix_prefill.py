@@ -20,6 +20,30 @@ IS_TURING = current_platform.get_device_capability() == (7, 5)
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
+def _build_compacted_context_lens(
+    token_presence_bitmap: torch.Tensor,
+    context_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Build compacted prefix lengths for compressed-cache prefill.
+
+    Args:
+        token_presence_bitmap: [num_seqs, num_kv_heads, max_ctx_len] tensor.
+        context_lens: [num_seqs] tensor with original logical prefix lengths.
+
+    Returns:
+        [num_seqs] int32 tensor containing the number of kept prefix tokens.
+    """
+    positions = torch.arange(
+        token_presence_bitmap.shape[-1],
+        device=token_presence_bitmap.device,
+        dtype=torch.int32,
+    ).view(1, 1, -1)
+    valid_positions = positions < context_lens.to(torch.int32).view(-1, 1, 1)
+    present_mask = token_presence_bitmap.ne(0) & valid_positions
+    kept_counts = present_mask.sum(dim=-1, dtype=torch.int32)
+    return kept_counts[:, 0].contiguous()
+
+
 # Here's an example autotuner config for this kernel. This config does provide
 # a performance improvement, but dramatically increases first call latency in
 # triton 3.2. Because of this tradeoff, it's currently commented out.
@@ -50,6 +74,7 @@ def _fwd_kernel(
     out_scale_inv,
     B_Start_Loc,
     B_Seqlen,
+    B_Compacted_Ctx_Len,
     x: tl.constexpr,
     Out,
     stride_b_loc_b,
@@ -89,6 +114,7 @@ def _fwd_kernel(
     SKIP_DECODE: tl.constexpr,
     USE_SINKS: tl.constexpr,
     USE_FP8: tl.constexpr,
+    USE_COMPACTED_CONTEXT: tl.constexpr,
     CAUSAL: tl.constexpr = True,
     MAX_Q_LEN: tl.constexpr = 0,
     MAX_CTX_LEN: tl.constexpr = 0,
@@ -106,6 +132,10 @@ def _fwd_kernel(
     cur_batch_in_all_stop_index = tl.load(B_Start_Loc + cur_batch + 1)
     cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
     cur_batch_ctx_len = cur_batch_seq_len - cur_batch_query_len
+    if USE_COMPACTED_CONTEXT:
+        cur_batch_cache_len = tl.load(B_Compacted_Ctx_Len + cur_batch)
+    else:
+        cur_batch_cache_len = cur_batch_ctx_len
 
     if SKIP_DECODE and cur_batch_query_len == 1:
         return
@@ -156,7 +186,7 @@ def _fwd_kernel(
 
     # compute query against context (no causal mask here)
     for start_n in tl.range(
-        0, cur_batch_ctx_len, BLOCK_SIZE, loop_unroll_factor=num_unroll_cache
+        0, cur_batch_cache_len, BLOCK_SIZE, loop_unroll_factor=num_unroll_cache
     ):
         # Under a block size of 544 (Qwen/Qwen3-Next-80B-A3B-Thinking),
         # replace one physical block every 17 32-Tile blocks
@@ -192,13 +222,13 @@ def _fwd_kernel(
         )
 
         if (
-            start_n + BLOCK_SIZE > cur_batch_ctx_len
+            start_n + BLOCK_SIZE > cur_batch_cache_len
             or BLOCK_DMODEL != BLOCK_DMODEL_PADDED
         ):
             k_load = tl.load(
                 K_cache + off_k,
                 mask=dim_mask[:, None]
-                & ((start_n + offs_bs_n[None, :]) < cur_batch_ctx_len),
+                & ((start_n + offs_bs_n[None, :]) < cur_batch_cache_len),
                 other=0.0,
             )  # [D,N]
         else:
@@ -212,7 +242,7 @@ def _fwd_kernel(
         # qk = tl.zeros([BLOCK_M, BLOCK_SIZE], dtype=tl.float32)  # [M,N]
         qk = sm_scale * tl.dot(q, k, input_precision=IN_PRECISION)
         qk = tl.where(
-            (start_n + offs_bs_n[None, :]) < cur_batch_ctx_len, qk, float("-inf")
+            (start_n + offs_bs_n[None, :]) < cur_batch_cache_len, qk, float("-inf")
         )
         # qk *= sm_scale
         if SLIDING_WINDOW > 0:
@@ -245,13 +275,13 @@ def _fwd_kernel(
 
         # update acc
         if (
-            start_n + BLOCK_SIZE > cur_batch_ctx_len
+            start_n + BLOCK_SIZE > cur_batch_cache_len
             or BLOCK_DMODEL != BLOCK_DMODEL_PADDED
         ):
             v_load = tl.load(
                 V_cache + off_v,
                 mask=dim_mask[None, :]
-                & ((start_n + offs_bs_n[:, None]) < cur_batch_ctx_len),
+                & ((start_n + offs_bs_n[:, None]) < cur_batch_cache_len),
                 other=0.0,
             )  # [N,D]
         else:
@@ -668,6 +698,7 @@ def context_attention_fwd(
     sinks=None,
     is_block_table_ptr: bool = False,
     causal: bool = True,
+    token_presence_bitmap: torch.Tensor | None = None,
 ):
     q_dtype_is_f32 = q.dtype is torch.float32
 
@@ -719,6 +750,22 @@ def context_attention_fwd(
     # 0 means "disable"
     if sliding_window is None or sliding_window <= 0:
         sliding_window = 0
+
+    compacted_ctx_lens = None
+    if token_presence_bitmap is not None:
+        if alibi_slopes is not None:
+            raise NotImplementedError(
+                "Compressed-cache prefill does not support ALiBi yet."
+            )
+        if sliding_window > 0:
+            raise NotImplementedError(
+                "Compressed-cache prefill does not support sliding_window yet."
+            )
+        query_lens = (b_start_loc[1:] - b_start_loc[:-1]).to(torch.int32)
+        context_lens = (b_seq_len.to(torch.int32) - query_lens).contiguous()
+        compacted_ctx_lens = _build_compacted_context_lens(
+            token_presence_bitmap, context_lens
+        )
 
     if is_block_table_ptr:
         kv_element_size = k_cache.element_size()
@@ -831,6 +878,7 @@ def context_attention_fwd(
         1.0 / fp8_out_scale if fp8_out_scale is not None else 1.0,
         b_start_loc,
         b_seq_len,
+        compacted_ctx_lens if compacted_ctx_lens is not None else b_seq_len,
         k_cache.shape[4],
         o,
         processed_b_loc.stride(0),
@@ -865,6 +913,7 @@ def context_attention_fwd(
         SLIDING_WINDOW=sliding_window,
         SKIP_DECODE=skip_decode,
         USE_FP8=fp8_out_scale is not None,
+        USE_COMPACTED_CONTEXT=compacted_ctx_lens is not None,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         num_unroll_cache=4,

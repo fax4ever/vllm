@@ -21,6 +21,30 @@ logger = init_logger(__name__)
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
+def _build_compacted_seq_lens(
+    token_presence_bitmap: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Build compacted decode lengths for compressed-cache decode.
+
+    Args:
+        token_presence_bitmap: [num_seqs, num_kv_heads, max_seq_len] tensor.
+        seq_lens: [num_seqs] tensor with original logical sequence lengths.
+
+    Returns:
+        [num_seqs] int32 tensor containing the number of kept tokens.
+    """
+    positions = torch.arange(
+        token_presence_bitmap.shape[-1],
+        device=token_presence_bitmap.device,
+        dtype=torch.int32,
+    ).view(1, 1, -1)
+    valid_positions = positions < seq_lens.to(torch.int32).view(-1, 1, 1)
+    present_mask = token_presence_bitmap.ne(0) & valid_positions
+    kept_counts = present_mask.sum(dim=-1, dtype=torch.int32)
+    return kept_counts[:, 0].contiguous()
+
+
 def has_native_kv_cache_layout(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -51,6 +75,7 @@ def kernel_paged_attention_2d(
     sink_ptr,  # [num_query_heads]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
+    compacted_seq_lens_ptr,  # [num_seqs]
     alibi_slopes_ptr,  # [num_query_heads]
     scale,  # float32
     k_scale,  # float32
@@ -83,6 +108,7 @@ def kernel_paged_attention_2d(
     filter_by_query_len: tl.constexpr,  # bool
     query_start_len_ptr,  # [num_seqs+1]
     USE_SINKS: tl.constexpr,  # bool
+    USE_COMPACTED_SEQ_LENS: tl.constexpr,  # bool
     USE_FP8: tl.constexpr,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
@@ -137,6 +163,10 @@ def kernel_paged_attention_2d(
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
+    if USE_COMPACTED_SEQ_LENS:
+        compacted_seq_len = tl.load(compacted_seq_lens_ptr + seq_idx)
+    else:
+        compacted_seq_len = seq_len
 
     # alibi slope for this head
     if USE_ALIBI_SLOPES:
@@ -144,7 +174,7 @@ def kernel_paged_attention_2d(
             alibi_slopes_ptr + query_head_idx, mask=head_mask, other=0.0
         )
 
-    num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
+    num_blocks = cdiv_fn(compacted_seq_len, BLOCK_SIZE)
 
     offs_n = tl.arange(0, BLOCK_SIZE)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
@@ -205,7 +235,7 @@ def kernel_paged_attention_2d(
             V = V_load
 
         seq_offset = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        boundary = tl.full([BLOCK_SIZE], seq_len, dtype=tl.int32)
+        boundary = tl.full([BLOCK_SIZE], compacted_seq_len, dtype=tl.int32)
         seq_mask = seq_offset[None, :] < boundary
 
         # First calculate the dot, then apply the mask.
@@ -284,6 +314,7 @@ def chunked_prefill_paged_decode(
     output_scale=None,
     # Optional tensor for sinks
     sinks=None,
+    token_presence_bitmap: torch.Tensor | None = None,
     is_block_table_ptr: bool = False,
     causal: bool = True,
 ):
@@ -294,6 +325,20 @@ def chunked_prefill_paged_decode(
 
     if sliding_window is None or sliding_window <= 0:
         sliding_window = 0
+
+    compacted_seq_lens = None
+    if token_presence_bitmap is not None:
+        if alibi_slopes is not None:
+            raise NotImplementedError(
+                "Compressed-cache decode does not support ALiBi yet."
+            )
+        if sliding_window > 0:
+            raise NotImplementedError(
+                "Compressed-cache decode does not support sliding_window yet."
+            )
+        compacted_seq_lens = _build_compacted_seq_lens(
+            token_presence_bitmap, seq_lens
+        )
 
     if max_query_len > 1:
         context_attention_fwd(
@@ -318,6 +363,7 @@ def chunked_prefill_paged_decode(
             fp8_out_scale=output_scale,
             sinks=sinks,
             causal=causal,
+            token_presence_bitmap=token_presence_bitmap,
         )
 
     block_size = value_cache.shape[3]
@@ -367,7 +413,7 @@ def chunked_prefill_paged_decode(
     # stride-padded hybrid layouts. The latter use reshape_and_cache_flash
     # during cache update, so keep decode on the matching stride-aware path.
     is_pow2 = block_size > 0 and (block_size & (block_size - 1) == 0)
-    if not is_pow2 or not has_native_layout:
+    if not is_pow2 or not has_native_layout or token_presence_bitmap is not None:
         use_custom = False
 
     if use_custom:
@@ -452,6 +498,9 @@ def chunked_prefill_paged_decode(
             sink_ptr=sinks,
             block_tables_ptr=processed_block_table,
             seq_lens_ptr=seq_lens,
+            compacted_seq_lens_ptr=(
+                compacted_seq_lens if compacted_seq_lens is not None else seq_lens
+            ),
             alibi_slopes_ptr=alibi_slopes,
             scale=sm_scale,
             k_scale=k_scale,
@@ -484,5 +533,6 @@ def chunked_prefill_paged_decode(
             filter_by_query_len=True,
             query_start_len_ptr=query_start_loc,
             USE_SINKS=sinks is not None,
+            USE_COMPACTED_SEQ_LENS=compacted_seq_lens is not None,
             USE_FP8=output_scale is not None,
         )
