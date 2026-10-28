@@ -1313,7 +1313,9 @@ class Scheduler(SchedulerInterface):
                 num_discarded,
             ) in model_runner_output.kv_compression_discarded.items():
                 req = self.requests.get(req_id)
-                if req is not None:
+                # A result can arrive after preemption freed this request's
+                # cache. Its discarded entries belong to the old allocation.
+                if req is not None and req.status == RequestStatus.RUNNING:
                     req.num_kv_discarded += num_discarded
 
         failed_kv_load_req_ids = None

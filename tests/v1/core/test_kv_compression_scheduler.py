@@ -133,3 +133,46 @@ def test_kv_compression_reset_on_preemption():
     assert request.status == RequestStatus.PREEMPTED
     assert request.num_computed_tokens == 0
     assert request.num_kv_discarded == 0
+
+
+def test_kv_compression_ignores_output_after_preemption():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=64,
+        max_model_len=512,
+        async_scheduling=True,
+    )
+    requests = create_requests(num_requests=1, num_tokens=256, max_tokens=20)
+    request = requests[0]
+    scheduler.add_request(request)
+
+    # Three prefill chunks finish without generating a token.
+    for _ in range(3):
+        scheduler_output = scheduler.schedule()
+        output = _make_output(scheduler_output, requests)
+        output.sampled_token_ids = []
+        scheduler.update_from_output(scheduler_output, output)
+
+    # The final prefill chunk is in flight when the scheduler preempts it.
+    scheduler_output = scheduler.schedule()
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, 0.0)
+    # The intervening scheduling step did not include the preempted request.
+    scheduler.prev_step_scheduled_req_ids.clear()
+    assert request.num_kv_discarded == 0
+
+    # Its late result refers to the freed cache. Preserve the generated token,
+    # but do not apply its discarded-KV count to the new cache allocation.
+    output = _make_output(
+        scheduler_output,
+        requests,
+        kv_compression_discarded={request.request_id: 192},
+    )
+    scheduler.update_from_output(scheduler_output, output)
+    assert request.num_kv_discarded == 0
+    assert request.num_output_tokens == 1
+
+    resumed = scheduler.schedule()
+    assert request.request_id in resumed.scheduled_cached_reqs.resumed_req_ids
+    blocks = resumed.scheduled_cached_reqs.new_block_ids[0]
+    assert blocks is not None
+    assert len(blocks[0]) == 4  # The first 64 recomputed tokens need four blocks.
